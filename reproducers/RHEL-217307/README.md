@@ -17,7 +17,16 @@ gcc -g -O0 -o reproduce reproduce.c -lselinux
 
 ## Result
 
-Verified on RHEL 10.3 Beta (libselinux-3.11-1.el10, kernel 6.12.0-254.el10):
+Verified on both:
+- RHEL 10.3 Beta (libselinux-3.11-1.el10, kernel 6.12.0-254.el10): not vulnerable
+- RHEL 10.2 (libselinux-3.10-1.el10, kernel 6.12.0-211.40.1.el10_2): not vulnerable
+
+Identical result on both versions, which is expected: the behavior in
+question is determined by the kernel's handling of `/proc/self/fd/N` magic
+symlinks, not by anything in libselinux itself, and both machines run
+kernel 6.12.
+
+On libselinux-3.11:
 
 ```
 symlink's own context : unconfined_u:object_r:tmp_t:s0

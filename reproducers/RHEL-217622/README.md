@@ -17,9 +17,22 @@ ASAN_OPTIONS=detect_leaks=0 ./reproduce dir1 dir2
 attribute set (written by `restorecon -D`; not supported on tmpfs/ramfs, so
 use a persistent filesystem such as `/var/tmp` on a non-tmpfs mount).
 
+`dir1`/`dir2` must live under a path prefix that file_contexts actually has
+a spec for (e.g. `/root`, matched by `/root(/.*)?`) - otherwise `restorecon
+-D` has no default label to apply and silently skips writing the digest
+xattr entirely, which surfaces as "no security.sehash entries found" from
+this reproducer rather than as a false negative.
+
 ## Result
 
-Verified on RHEL 10.3 Beta (libselinux-3.11-1.el10):
+Verified on both:
+- RHEL 10.3 Beta (libselinux-3.11-1.el10): vulnerable
+- RHEL 10.2 (libselinux-3.10-1.el10): vulnerable
+
+Same crash on both versions, since the code path exercised here was never
+touched by the one fix that did land for this function.
+
+On libselinux-3.11:
 
 ```
 ==7157==ERROR: AddressSanitizer: heap-use-after-free on address ...
