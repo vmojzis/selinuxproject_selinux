@@ -45,12 +45,22 @@ previously allocated by thread T0 here:
     #1 ... in add_xattr_entry (/lib64/libselinux.so.1+0x15439)
 ```
 
-**Still vulnerable.** Upstream commit `b5a23d7f30c1` ("libselinux:
-restorecon_xattr: clear dir_xattr_* after freeing") only resets the
-`dir_xattr_list`/`dir_xattr_last` statics on the internal error-cleanup path
-of the recursive walk. It does not reset them on the normal success path,
-which is exactly the documented usage pattern this reproducer follows: call
-the function, free the returned list as the API contract requires, then
-call it again in the same process. The second call appends through
-`dir_xattr_last->next`, a dangling pointer left over from the first call's
-now-freed list, corrupting the heap.
+**Still vulnerable as of the above versions.** Upstream commit `b5a23d7f30c1`
+("libselinux: restorecon_xattr: clear dir_xattr_* after freeing") only
+resets the `dir_xattr_list`/`dir_xattr_last` statics on the internal
+error-cleanup path of the recursive walk. It does not reset them on the
+normal success path, which is exactly the documented usage pattern this
+reproducer follows: call the function, free the returned list as the API
+contract requires, then call it again in the same process. The second call
+appends through `dir_xattr_last->next`, a dangling pointer left over from
+the first call's now-freed list, corrupting the heap.
+
+## Fix
+
+Fixed in this repository by commit `87cb8c321d3e` ("libselinux:
+restorecon_xattr: reset dir_xattr_list on every call"), which resets both
+statics to `NULL` at the top of `selinux_restorecon_xattr()` on every call,
+not just in the error-cleanup path. Rebuilt libselinux from source with
+this change on RHEL 10.2 (libselinux-3.10) and reran this reproducer
+against it: no ASan report, "second call completed without a detected
+use-after-free".
